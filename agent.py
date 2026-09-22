@@ -65,18 +65,28 @@ def run_agent(pnr: str, last_name: str, message: str) -> str:            # ✏�
         thinking={"type": "adaptive"}, tools=tools, messages=messages,
     )
 
-    answer = ""
     turns = 1
     while response.stop_reason == "tool_use" and turns < MAX_TOOL_CALLS:
-        messages.append({"role": "assistant", "content": text_of(response)})
+        # the whole assistant turn goes back, thinking and tool_use blocks included:
+        # every tool_result below has to answer a tool_use the API can still see
+        messages.append({"role": "assistant", "content": response.content})
         messages.append({"role": "user", "content": tool_results(response)})
-        answer = text_of(response)
         response = client.messages.create(
             model=MODEL, max_tokens=4096, system=runtime_preamble() + SYSTEM_PROMPT + TONE_ADDENDUM,
             thinking={"type": "adaptive"}, tools=tools, messages=messages,
         )
         turns += 1
 
+    # the answer is the text of the turn that stopped asking, not the one before it
+    answer = text_of(response)
+
+    # Fixed: the loop has two exits, and only one of them produces an answer. If it
+    # left because the cap was reached, the last turn is still a tool_use turn and its
+    # text is usually empty — the caller (run.py, demo/serve.py) would show a blank
+    # reply with no hint that anything went wrong. Say so instead of returning "".
+    if not answer and response.stop_reason == "tool_use":
+        return ("I've hit the limit of what I can work through automatically on this "
+                "one, so I'm handing it to a colleague who can finish it with you.")
     return answer
 
 
@@ -118,18 +128,54 @@ def build_tools() -> List[Dict[str, Any]]:                 # ✏️ Build 1, ste
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "flight_no": {"type": "string"},
-                    "date": {"type": "string", "description": "MM/DD/YYYY"},
+                    "flight_no": {
+                        "type": "string",
+                        "description": (
+                            "The marketing flight number as Altura returns it, e.g. 'LK415'. "
+                            "Larkspur Link segments carry the same LK prefix."
+                        ),
+                    },
+                    "date": {
+                        "type": "string",
+                        "description": (
+                            "The segment's local departure date in ISO-8601, YYYY-MM-DD, "
+                            "e.g. '2025-05-08'. OpsFeed refuses any other shape rather than "
+                            "guessing, so pass through the date lookup_booking gave you for "
+                            "this segment unchanged; do not reformat it."
+                        ),
+                    },
                 },
                 "required": ["flight_no", "date"],
             },
         },
         {
+            # Fixed: the description was the single word "search". A description is
+            # all Claude is ever told about a tool, and "search" does not say what it
+            # searches, what it returns, or when to reach for it — so the model skipped
+            # it and asked the customer for flight options it could have looked up
+            # itself. Spelling out the return shape (option_ids, wait time) also makes
+            # the downstream tools usable: hold_seat and check_policy both take an
+            # option_id that only this tool can produce.
             "name": "search_alternatives",
-            "description": "search",
+            "description": (
+                "Find the re-accommodation options Larkspur can actually offer for this "
+                "booking's disrupted segment. Takes the PNR alone: origin, destination, "
+                "date, cabin and party size are read from the booking, so there is nothing "
+                "to guess and no need to ask the customer for them. Returns a list of "
+                "options, each with an option_id, flight number, departure date and time, "
+                "and the wait in minutes from the original departure. Call this before "
+                "quoting any alternative. You do not have to wait for the customer to pick "
+                "one: check_policy resolves entitlements from the earliest option on its "
+                "own, and takes chosen_option_id only once there is a choice to price."
+            ),
             "input_schema": {
                 "type": "object",
-                "properties": {"pnr": {"type": "string"}},
+                "properties": {
+                    "pnr": {
+                        "type": "string",
+                        "description": "The confirmation code of the booking to re-accommodate.",
+                    },
+                },
                 "required": ["pnr"],
             },
         },

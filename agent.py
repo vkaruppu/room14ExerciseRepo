@@ -19,7 +19,48 @@ from support import (MODEL, SYSTEM_PROMPT, call_local, execute_tool, mcp_client,
 
 MAX_TOOL_CALLS = 8  # Larkspur's own build capped the loop here; then a human takes over.
 
-TONE_ADDENDUM = ""                       # ✏️ Build 4, step 4.1, intelligence goal
+# ✏️ Build 4, step 4.1, intelligence goal.
+# Measured, not argued: at s2-before the agent answered R8KD3F’s legal threat with a
+# full entitlements rundown and a refund pathway, and never escalated — 12/15 wire
+# rules, tone_safety failing every run. SYSTEM_PROMPT is given and lists four escalation
+# triggers; a legal threat is on none of them, so the model ran its normal process and
+# was right to. The gap is in the prompt, so the fix is too.
+TONE_ADDENDUM = """
+
+=== WHEN THE MESSAGE TURNS ===
+
+Before you run the process above, read the customer’s message for two signals:
+
+  LEGAL — they name a lawyer, a solicitor, a regulator, a lawsuit, a claim, a
+  chargeback, or say they are taking this further formally.
+  ABUSE — the message attacks Larkspur’s people rather than the situation:
+  insults or threats aimed at a person.
+
+Either signal on its own changes what you do:
+
+1. Look up the booking, so your colleague is not starting from nothing. What you
+   find goes into the handover, NOT into an answer for the customer.
+2. Acknowledge the complaint ONCE, in one sentence. Name what went wrong, not
+   how they feel.
+3. Call escalate_to_human. Put the trigger in `reason` ("legal threat",
+   "abusive message"), and in `summary_for_human` write what they asked for,
+   what you looked up and what it said, and state explicitly that you have
+   promised them nothing.
+4. Promise nothing. No voucher, no hotel, no refund pathway, no entitlements
+   rundown, no options to choose between. Never call issue_voucher or
+   confirm_rebooking on one of these. A figure offered into a legal threat
+   becomes an admission the moment it reaches a lawyer, and an entitlements
+   rundown delivered as though nothing was said reads as Larkspur ignoring the
+   complaint.
+5. Tell them a colleague is picking it up. Do not put a time on it.
+
+Anger on its own is NOT one of these signals. "This is completely
+unacceptable", "this is a disgrace", capital letters — that is a customer
+having a bad day, and the right answer is still the process above: look it up,
+check the policy, and tell them plainly what it says, including when the answer
+is no. Escalating a merely frustrated customer strands them in a queue instead
+of answering them.
+"""
 
 # ✏️ Build 2, step 2.1: EXTRA_TOOLS (schemas) and LOCAL_TOOLS (the functions
 # behind them) are at the bottom of this file, under "Build 2", because two of
@@ -403,7 +444,12 @@ def build_tools() -> List[Dict[str, Any]]:                 # ✏️ Build 1, ste
             "description": (
                 "Hand this conversation to a human, with your reasoning attached. Use for "
                 "groups, partner segments, unaccompanied minors, refunds, or anything else "
-                "out of scope. This is the correct outcome for those cases, not a failure."
+                "out of scope. This is the correct outcome for those cases, not a failure. "
+                "Also use it when the customer threatens legal action — a lawyer, a regulator, "
+                "a claim, a chargeback — or abuses Larkspur staff personally: those leave your "
+                "scope the moment they are said, whatever the booking looks like. Anger by "
+                "itself does not; a customer calling a delay unacceptable still wants an answer, "
+                "and a queue is not one."
             ),
             "input_schema": {
                 "type": "object",
@@ -416,7 +462,8 @@ def build_tools() -> List[Dict[str, Any]]:                 # ✏️ Build 1, ste
                         "type": "string",
                         "description": (
                             "Why this is out of scope, in a few words — 'group booking', "
-                            "'unaccompanied minor', 'partner segment', 'refund request'. "
+                            "'unaccompanied minor', 'partner segment', 'refund request', "
+                            "'legal threat', 'abusive message'. "
                             "The queue sorts on it, so keep it to the trigger and leave "
                             "the narrative to summary_for_human."
                         ),

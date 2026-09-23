@@ -9,9 +9,6 @@ Where you edit:   grep -n '✏' agent.py   (six marks, one per place)
 Steps and gates:  https://anthropicpartnerbasecamp.bts.com/
 """
 from __future__ import annotations
-import json
-import re
-from pathlib import Path
 from typing import Any, Dict, List
 from support import (MODEL, SYSTEM_PROMPT, call_local, execute_tool, mcp_client,
                      new_session, next_available_day, record_tool_result,
@@ -19,13 +16,42 @@ from support import (MODEL, SYSTEM_PROMPT, call_local, execute_tool, mcp_client,
 
 MAX_TOOL_CALLS = 8  # Larkspur's own build capped the loop here; then a human takes over.
 
-TONE_ADDENDUM = ""                       # ✏️ Build 4, step 4.1, intelligence goal
-
-# ✏️ Build 2, step 2.1: EXTRA_TOOLS (schemas) and LOCAL_TOOLS (the functions
-# behind them) are at the bottom of this file, under "Build 2", because two of
-# the three functions are written there and a dict cannot name a function that
-# does not exist yet. Nothing else moved: tool_list() and tool_results() read
-# both names at call time, not at import time.
+TONE_ADDENDUM = (
+    "\n\nABUSE / LEGAL THREAT RULE: If a customer is abusive, threatening legal action, "
+    "shouting, or otherwise hostile, this is no longer a normal disruption-policy "
+    "conversation. Do not continue the entitlement flow, do not discuss refunds, "
+    "do not offer vouchers, and do not attempt any rebooking or confirmation steps. "
+    "Acknowledge the complaint once, say you are escalating to a human, and call "
+    "escalate_to_human immediately with a brief summary. Never call issue_voucher, "
+    "confirm_rebooking, search_alternatives, or check_policy in that branch. Keep the "
+    "reply very brief, calm, and professional. For non-abusive refund requests or "
+    "other out-of-scope asks, say plainly that a human executes refunds and "
+    "escalate to a human instead of attempting the action yourself."
+)                       # ✏️ Build 4, step 4.1, intelligence goal
+EXTRA_TOOLS: List[Dict[str, Any]] = [
+    {
+        "name": "earliest_open_day",
+        "description": (
+            "Answer when a stranded customer can actually fly out: what is the soonest day "
+            "you can get them out of the disrupted origin airport. Use this for questions "
+            "about dates and how long they are stuck, not for choosing a specific flight. "
+            "It requires the origin, destination, disrupted travel date, and cabin, and then "
+            "returns the earliest date with an open seat as YYYY-MM-DD or clearly says none "
+            "is available in the schedule it can see."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "origin": {"type": "string", "description": "Three-letter IATA departure airport, e.g. DEN."},
+                "dest": {"type": "string", "description": "Three-letter IATA arrival airport, e.g. BOI."},
+                "date": {"type": "string", "description": "The disrupted travel date in ISO format, YYYY-MM-DD."},
+                "cabin": {"type": "string", "enum": ["Y", "J"], "description": "Cabin to search; Y for main, J for first."},
+            },
+            "required": ["origin", "dest", "date"],
+        },
+    }
+]   # ✏️ Build 2, step 2.1: schemas for the tools you add
+LOCAL_TOOLS: Dict[str, Any] = {"earliest_open_day": next_available_day}         # ✏️ Build 2, step 2.1: the functions behind them
 
 
 def text_of(response) -> str:
@@ -98,9 +124,10 @@ def run_agent(pnr: str, last_name: str, message: str) -> str:            # ✏�
 
 
 def tool_list() -> List[Dict[str, Any]]:                   # ✏️ Build 2, step 2.2
-    """Given. Exactly what Claude is offered on every turn; run.py --show-tools
-    prints this list."""
-    return build_tools() + EXTRA_TOOLS + mcp_client.tools()
+    """Exactly what Claude is offered on every turn. The model sees the same
+    real-world routing surface as the direct tool loop, while the local custom
+    tool stays available for the in-process fallback and the 2.1 probe."""
+    return build_tools() + mcp_client.tools() + EXTRA_TOOLS
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -402,8 +429,9 @@ def build_tools() -> List[Dict[str, Any]]:                 # ✏️ Build 1, ste
             "name": "escalate_to_human",
             "description": (
                 "Hand this conversation to a human, with your reasoning attached. Use for "
-                "groups, partner segments, unaccompanied minors, refunds, or anything else "
-                "out of scope. This is the correct outcome for those cases, not a failure."
+                "abusive or threatening customers, legal threats, groups, partner segments, "
+                "unaccompanied minors, refunds, or anything else out of scope. This is "
+                "the correct outcome for those cases, not a failure."
             ),
             "input_schema": {
                 "type": "object",

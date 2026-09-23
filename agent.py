@@ -14,8 +14,7 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List
 from support import (MODEL, SYSTEM_PROMPT, call_local, execute_tool, mcp_client,
-                     new_session, next_available_day, record_tool_result,
-                     runtime_preamble)
+                     new_session, next_available_day, record_tool_result)
 
 MAX_TOOL_CALLS = 8  # Larkspur's own build capped the loop here; then a human takes over.
 
@@ -100,7 +99,7 @@ def tool_results(response) -> List[Dict[str, Any]]:
     return results
 
 
-def system_blocks(preamble: str = "") -> List[Dict[str, Any]]:
+def system_blocks() -> List[Dict[str, Any]]:
     """The system prompt as cache-aware blocks, static part first.
 
     Prompt caching matches an EXACT prefix, and runtime_preamble() is a clock
@@ -118,8 +117,11 @@ def system_blocks(preamble: str = "") -> List[Dict[str, Any]]:
     AFTER the breakpoint, where it can change every second and invalidate
     nothing. The model still gets the time; it just stops poisoning the cache.
 
-    support/data.py is given and not ours to edit, so runtime_preamble() keeps
-    returning exactly what it always returned. What changed is where we put it.
+    The clock is gone from here entirely now: it is the current_time tool, so
+    there is no volatile byte left in the prefix at all and this block is the
+    whole system prompt. support/data.py is given and untouched --
+    runtime_preamble() still returns what it always did, we just stopped
+    calling it.
     """
     return [
         {
@@ -127,7 +129,6 @@ def system_blocks(preamble: str = "") -> List[Dict[str, Any]]:
             "text": SYSTEM_PROMPT + TONE_ADDENDUM,
             "cache_control": {"type": "ephemeral"},
         },
-        {"type": "text", "text": preamble or runtime_preamble()},
     ]
 
 
@@ -143,10 +144,10 @@ def cache_conversation(messages: List[Dict[str, Any]]) -> None:
     input side. The messages were never the problem; the clock in front of
     them was, the same bug as the original one layer down.
 
-    run_agent() now resolves runtime_preamble() ONCE per contact and hands the
-    same string to every turn, which makes this region stable and this mark
-    worth paying for. Only user messages are marked: assistant turns come back
-    as SDK objects and this rewrites dicts we built ourselves.
+    Freezing the clock per contact fixed it; moving the clock into the
+    current_time tool retired the problem instead, so nothing volatile sits
+    ahead of the messages at all. Only user messages are marked: assistant
+    turns come back as SDK objects and this rewrites dicts we built ourselves.
     """
     last = messages[-1]
     if last.get("role") != "user":
@@ -171,14 +172,13 @@ def run_agent(pnr: str, last_name: str, message: str) -> str:            # ✏�
     """Run the tool loop until Claude stops asking for tools. Return its final text."""
     client, tracer = new_session()
     tools = tool_list()
-    preamble = runtime_preamble()   # once per contact: see cache_conversation()
     messages = [
         {"role": "user", "content": f"PNR {pnr}, last name {last_name}. {message}"},
     ]
 
     cache_conversation(messages)
     response = client.messages.create(
-        model=MODEL, max_tokens=4096, system=system_blocks(preamble),
+        model=MODEL, max_tokens=4096, system=system_blocks(),
         thinking={"type": "adaptive"}, tools=tools, messages=messages,
     )
 
@@ -190,7 +190,7 @@ def run_agent(pnr: str, last_name: str, message: str) -> str:            # ✏�
         messages.append({"role": "user", "content": tool_results(response)})
         cache_conversation(messages)
         response = client.messages.create(
-            model=MODEL, max_tokens=4096, system=system_blocks(preamble),
+            model=MODEL, max_tokens=4096, system=system_blocks(),
             thinking={"type": "adaptive"}, tools=tools, messages=messages,
         )
         turns += 1
@@ -720,6 +720,30 @@ def _reopen_row(ticket_type: str, records: List[Dict[str, Any]]) -> Dict[str, An
     }
 
 
+def current_time() -> Dict[str, Any]:
+    """The wall clock, on demand instead of in the prompt.
+
+    This used to be a line at the top of every system prompt, from
+    runtime_preamble(). That is the most expensive place to put a value that
+    changes every second: prompt caching matches a byte-exact prefix, so a
+    clock in front of the instructions meant no two calls ever shared one, and
+    a clock in front of the MESSAGES meant the conversation could not be cached
+    either. Moving it behind a tool takes the last moving part out of the
+    prefix, so the whole system prompt is now static and cacheable, and the
+    model pays a round trip only on the turns that actually need the date.
+
+    support/data.py still owns the format; this reads the same clock it does.
+    """
+    from datetime import datetime
+    now = datetime.now()
+    return {
+        "now": now.strftime("%Y-%m-%d %H:%M:%S"),
+        "date": now.strftime("%Y-%m-%d"),
+        "note": ("Local time at the Larkspur care desk. Read the travel date off the "
+                 "booking rather than assuming it is today."),
+    }
+
+
 def reopen_stats(ticket_type: str = "") -> Dict[str, Any]:
     """How often this kind of ticket came back inside 72 hours, counted off the
     handled-transcript sample.
@@ -784,6 +808,20 @@ def reopen_stats(ticket_type: str = "") -> Dict[str, Any]:
 # -- the schemas Claude is offered, and the functions behind them -------------
 EXTRA_TOOLS: List[Dict[str, Any]] = [   # ✏️ Build 2, step 2.1: schemas for the tools you add
     {
+        "name": "current_time",
+        "description": (
+            "Today's date and the current local time at the care desk. Call it when the "
+            "answer depends on when 'now' is -- whether a delayed departure is still "
+            "today, what 'tonight' or 'tomorrow' means, or how far out an alternative "
+            "sits -- and not otherwise: it costs a round trip and most contacts never "
+            "need it, because the travel date is on the booking. It takes no arguments "
+            "and returns the full timestamp, the date on its own, and a reminder to "
+            "read the travel date off the booking rather than assuming it is today."
+        ),
+        "input_schema": {"type": "object", "properties": {}, "required": [],
+                         "additionalProperties": False},
+    },
+    {
         "name": "reopen_stats",
         "description": (
             "Check what went wrong last time on this kind of ticket, before you write the "
@@ -821,4 +859,5 @@ LOCAL_TOOLS: Dict[str, Any] = {         # ✏️ Build 2, step 2.1: the function
     # next_available_day and fare_rules moved out at 2.2: the MCP server owns
     # those names now, and a name can only have one owner.
     "reopen_stats": reopen_stats,               # written in this file, above
+    "current_time": current_time,               # written in this file, above
 }

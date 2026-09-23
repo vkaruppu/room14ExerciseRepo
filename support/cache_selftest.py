@@ -57,23 +57,32 @@ def structural_checks() -> None:
 
     blocks = agent.system_blocks()
 
-    check(isinstance(blocks, list) and len(blocks) >= 2,
+    check(isinstance(blocks, list) and len(blocks) >= 1,
           "system is a list of blocks",
-          "%d blocks; a bare string has nowhere to hang cache_control" % len(blocks))
+          "%d block(s); a bare string has nowhere to hang cache_control" % len(blocks))
 
     check("cache_control" in blocks[0],
           "the breakpoint is on the FIRST block",
           "marks the end of the static prefix")
 
-    # The whole bug this file exists to catch: anything that changes per call
-    # must sit AFTER the breakpoint, never before it.
+    # The whole bug this file exists to catch. The clock used to live here and
+    # held the hit rate at 0%; it is the current_time tool now, so NO block may
+    # carry it. Two calls a second apart must be byte-identical.
     volatile = "Current time:"
-    check(volatile not in blocks[0].get("text", ""),
-          "no clock inside the cached block",
-          "a per-second timestamp here pins the hit rate at 0%")
-    check(any(volatile in b.get("text", "") for b in blocks[1:]),
-          "the clock is present, after the breakpoint",
-          "the model still gets the time")
+    check(not any(volatile in b.get("text", "") for b in blocks),
+          "no clock anywhere in the system prompt",
+          "it belongs in the current_time tool, not the prefix")
+
+    import time as _t
+    first = json.dumps(agent.system_blocks())
+    _t.sleep(1.1)
+    check(first == json.dumps(agent.system_blocks()),
+          "system prompt is byte-identical one second later",
+          "anything that differs here cannot be cached")
+
+    check("current_time" in [t["name"] for t in agent.tool_list()],
+          "the clock is reachable as a tool",
+          "the model can still find out what time it is")
 
     # Byte-stability: same input, same bytes, every call.
     a, b, c = (json.dumps(agent.tool_list()) for _ in range(3))

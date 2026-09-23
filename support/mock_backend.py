@@ -390,6 +390,7 @@ def resolve_policy(cause_code, delay_minutes, status, fare_family, loyalty_tier,
 _holds = {}            # hold_id -> {option_id, pnr, expires_at}
 _confirmation_tokens = {}   # hold_id -> token, minted only by the "customer click"
 _confirmed = {}         # hold_id -> confirmation record
+_recent_actions = {}    # pnr -> {action, at, record_id}
 _vouchers = []
 _escalations = []
 _confirmations_sent = []
@@ -397,10 +398,15 @@ _confirmations_sent = []
 HOLD_TTL_MINUTES = 15
 
 
+def _record_action(pnr, action, record_id=None):
+    _recent_actions[pnr] = {"action": action, "record_id": record_id, "at": FIXTURE_CLOCK.isoformat()}
+
+
 def hold_seat(option_id, pnr):
     hold_id = f"HOLD-{secrets.token_hex(3).upper()}"
     _holds[hold_id] = {"option_id": option_id, "pnr": pnr,
                         "expires_at": FIXTURE_CLOCK + timedelta(minutes=HOLD_TTL_MINUTES)}
+    _record_action(pnr, "hold_seat", hold_id)
     return {"hold_id": hold_id, "option_id": option_id, "expires_in_minutes": HOLD_TTL_MINUTES}
 
 
@@ -426,6 +432,7 @@ def confirm_rebooking(hold_id, confirmation_token):
     record = {"hold_id": hold_id, **_holds.pop(hold_id)}
     del _confirmation_tokens[hold_id]
     _confirmed[hold_id] = record
+    _record_action(record["pnr"], "confirm_rebooking", hold_id)
     return {"status": "confirmed", "hold_id": hold_id, "option_id": record["option_id"]}
 
 
@@ -449,6 +456,7 @@ def issue_voucher(voucher_type, amount_usd, pnr, policy_row_id):
     record = {"voucher_id": voucher_id, "type": voucher_type, "amount_usd": amount_usd,
               "pnr": pnr, "policy_row_id": policy_row_id, "status": outcome}
     _vouchers.append(record)
+    _record_action(pnr, "issue_voucher", voucher_id)
     return record
 
 
@@ -457,13 +465,28 @@ def escalate_to_human(pnr, reason, summary_for_human, queue=None):
     record = {"escalation_id": escalation_id, "pnr": pnr, "reason": reason,
               "queue": queue, "summary_for_human": summary_for_human}
     _escalations.append(record)
+    _record_action(pnr, "escalate_to_human", escalation_id)
     return record
 
 
 def send_confirmation(pnr, message):
-    record = {"pnr": pnr, "message": message, "sent_at": FIXTURE_CLOCK.isoformat()}
+    if pnr not in _recent_actions:
+        return {
+            "status": "error",
+            "reason": "no_recent_action",
+            "note": "send_confirmation must follow a real booking action such as hold_seat, confirm_rebooking, issue_voucher, or escalate_to_human.",
+        }
+
+    message_id = f"MSG-{secrets.token_hex(3).upper()}"
+    record = {
+        "message_id": message_id,
+        "pnr": pnr,
+        "message": message,
+        "status": "sent",
+        "sent_at": FIXTURE_CLOCK.isoformat(),
+    }
     _confirmations_sent.append(record)
-    return {"status": "sent"}
+    return record
 
 
 # ---------------------------------------------------------------------------

@@ -100,16 +100,85 @@ def tool_results(response) -> List[Dict[str, Any]]:
     return results
 
 
+def system_blocks(preamble: str = "") -> List[Dict[str, Any]]:
+    """The system prompt as cache-aware blocks, static part first.
+
+    Prompt caching matches an EXACT prefix, and runtime_preamble() is a clock
+    that reads to the second. Concatenated the way this file used to do it --
+    runtime_preamble() + SYSTEM_PROMPT + TONE_ADDENDUM -- that timestamp sat in
+    the first ~30 tokens of every request, so no two calls ever shared a prefix
+    and every bench came back cache_read=0, cache_write=0, hit_pct=None. Wiring
+    cache_control without moving the clock would have changed none of that: the
+    breakpoint would have been real and the hit rate would still have been zero.
+
+    So the order is the fix and cache_control is only the switch. Block 1 is
+    everything that never changes; the breakpoint sits on it, and because tools
+    are sent ahead of system, it covers the 12 tool schemas too -- the ~5,000
+    tokens a turn this agent was buying new every call. Block 2 is the clock,
+    AFTER the breakpoint, where it can change every second and invalidate
+    nothing. The model still gets the time; it just stops poisoning the cache.
+
+    support/data.py is given and not ours to edit, so runtime_preamble() keeps
+    returning exactly what it always returned. What changed is where we put it.
+    """
+    return [
+        {
+            "type": "text",
+            "text": SYSTEM_PROMPT + TONE_ADDENDUM,
+            "cache_control": {"type": "ephemeral"},
+        },
+        {"type": "text", "text": preamble or runtime_preamble()},
+    ]
+
+
+def cache_conversation(messages: List[Dict[str, Any]]) -> None:
+    """Second breakpoint, on the end of the conversation, in place.
+
+    A cache region is a prefix from byte zero, so a mark on the last message
+    covers tools + BOTH system blocks + every earlier turn. That is the catch:
+    block 2 is the clock, and it sits ahead of the messages. With a per-call
+    timestamp this region could never match itself -- measured as cache_w
+    climbing 130, 462, 780, 2676 while cache_r stayed flat at 6,255, writing
+    the conversation every turn and reading it back never, for +31% on the
+    input side. The messages were never the problem; the clock in front of
+    them was, the same bug as the original one layer down.
+
+    run_agent() now resolves runtime_preamble() ONCE per contact and hands the
+    same string to every turn, which makes this region stable and this mark
+    worth paying for. Only user messages are marked: assistant turns come back
+    as SDK objects and this rewrites dicts we built ourselves.
+    """
+    last = messages[-1]
+    if last.get("role") != "user":
+        return
+    if isinstance(last["content"], str):                 # turn 1 ships a bare string
+        last["content"] = [{"type": "text", "text": last["content"]}]
+    blocks = [b for b in last["content"] if isinstance(b, dict)]
+    if not blocks:
+        return
+    blocks[-1]["cache_control"] = {"type": "ephemeral"}
+
+    # 4 breakpoints is the ceiling and system_blocks() holds one, so keep the
+    # newest 3 here and drop the oldest: a lookup only consults boundaries that
+    # exist in the request it is serving, so the older marks still earn a slot.
+    marked = [b for m in messages if isinstance(m.get("content"), list)
+              for b in m["content"] if isinstance(b, dict) and "cache_control" in b]
+    for stale in marked[:-3]:
+        stale.pop("cache_control", None)
+
+
 def run_agent(pnr: str, last_name: str, message: str) -> str:            # ✏️ Build 1, step 1.2
     """Run the tool loop until Claude stops asking for tools. Return its final text."""
     client, tracer = new_session()
     tools = tool_list()
+    preamble = runtime_preamble()   # once per contact: see cache_conversation()
     messages = [
         {"role": "user", "content": f"PNR {pnr}, last name {last_name}. {message}"},
     ]
 
+    cache_conversation(messages)
     response = client.messages.create(
-        model=MODEL, max_tokens=4096, system=runtime_preamble() + SYSTEM_PROMPT + TONE_ADDENDUM,
+        model=MODEL, max_tokens=4096, system=system_blocks(preamble),
         thinking={"type": "adaptive"}, tools=tools, messages=messages,
     )
 
@@ -119,8 +188,9 @@ def run_agent(pnr: str, last_name: str, message: str) -> str:            # ✏�
         # every tool_result below has to answer a tool_use the API can still see
         messages.append({"role": "assistant", "content": response.content})
         messages.append({"role": "user", "content": tool_results(response)})
+        cache_conversation(messages)
         response = client.messages.create(
-            model=MODEL, max_tokens=4096, system=runtime_preamble() + SYSTEM_PROMPT + TONE_ADDENDUM,
+            model=MODEL, max_tokens=4096, system=system_blocks(preamble),
             thinking={"type": "adaptive"}, tools=tools, messages=messages,
         )
         turns += 1

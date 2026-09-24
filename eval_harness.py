@@ -9,7 +9,7 @@
 
 You write the cases. This runs them, grades them, and applies the gates.
 
-The contract is Larkspur's own, from the engagement (case study, beat 6):
+Larkspur's contract, from the engagement (case study, beat 6):
 
     one call per transcript per suite
     evidence quoted per criterion BEFORE any verdict
@@ -17,51 +17,42 @@ The contract is Larkspur's own, from the engagement (case study, beat 6):
     UNKNOWN counts as FAIL and queues for the human panel
     one FAIL in a hard-gate suite blocks the release candidate
 
-One thing is NOT in that contract, and this file holds the line on it: a judge
-whose reply cannot be read is a grader failure, not an agent failure. When
-the judge's reply does not parse as JSON, the judge is asked once more for JSON
-only. If that reply does not parse either, the case is recorded as UNKNOWN,
-printed as such, left out of the pass rate on both sides, and never counted as
-a FAIL against the agent. A verdict of UNKNOWN that the judge itself chose (the
-transcript was ambiguous) is a different thing and still counts as a failure,
-exactly as the contract above says.
+One thing is NOT in that contract and this file holds the line on it: a judge
+whose reply cannot be read is a grader failure, not an agent failure. An
+unparseable reply is retried once, then recorded UNKNOWN, left out of the pass
+rate on both sides, and never counted as a FAIL against the agent. An UNKNOWN
+the judge itself chose is different and still counts as a failure.
 
-That last line is the whole point. A release does not ship on an average. It
-ships when no hard gate failed.
+A release does not ship on an average. It ships when no hard gate failed.
 
-Three grader types, and a case may carry more than one. ALL of a case's graders
-must pass for the case to pass:
+Three grader types; a case may carry more than one and ALL must pass:
 
-    rules    : deterministic, on the wire. must_call / must_not_call.
-               Free, instant, and the right grader for an irreversible action.
+    rules    : deterministic, on the wire. must_call / must_not_call. Free,
+               instant, and the right grader for an irreversible action.
     lexicon  : deterministic, on the text. must_contain / must_not_contain.
-               Cheap. Brittle if you use it for anything subtle.
-    judge    : a model call against the case's `expect` prose. It is shown the
-               customer's message, every tool call WITH what that tool returned,
-               and the agent's reply. The only grader that can read intent, and
-               the only one that can itself be wrong. Version your rubric.
+               Cheap. Brittle for anything subtle.
+    judge    : a model call against the case's `expect` prose. Shown the
+               customer's message, every tool call WITH what it returned, and
+               the agent's reply. The only grader that can read intent, and the
+               only one that can itself be wrong. Version your rubric.
 
 Larkspur's week 8: one suite fell to 37 of 48 overnight and nine of eleven
-failures were the grader, not the agent. Fixed in 40 minutes, no rollback. That
-is why the judge here reports its own evidence: so you can tell those apart.
+failures were the grader, not the agent. That is why the judge reports its own
+evidence: so you can tell those apart.
 
-THE JUDGE MODEL, and why it is not the agent's. Never let a model grade its own
-output. A judge on the same model id as the thing it is grading shares the
-blind spot that produced the answer: it reads its own phrasing as correct,
-because that is the phrasing it would have chosen. So JUDGE_MODEL defaults to
-claude-opus-4-8 while the agent runs on support/data.py's MODEL, a different
-tier. Up rather than down, on purpose: a judge has to be able to catch a fluent
-answer that contradicts a tool result, and a cheaper judge than the agent is a
-grader you cannot appeal to. It costs more per case and it is slower, which is
-the judge grader's charge and is worth naming out loud.
+THE JUDGE MODEL is not the agent's. A judge on the same model id shares the
+blind spot that produced the answer. JUDGE_MODEL defaults to claude-opus-4-8
+against the agent's support/data.py MODEL -- up a tier, on purpose, because a
+judge has to catch a fluent answer that contradicts a tool result. It costs more
+and is slower, which is this grader's charge.
 
-Swapping it is one environment variable, and doing so is the fastest way to see
-what a rubric actually rests on:
+Swapping it is one environment variable, and the fastest way to see what a
+rubric rests on:
 
     LARKSPUR_JUDGE_MODEL=claude-haiku-4-5 python3 eval_harness.py
 
-Diff the verdicts against the default run and write one line on which cases
-moved. A rubric that survives a judge swap is a rubric.
+Diff the verdicts and write one line on which cases moved. A rubric that
+survives a judge swap is a rubric.
 """
 
 from __future__ import annotations
@@ -80,7 +71,7 @@ CASES_PATH = os.path.join(HERE, "evals", "cases.json")
 EXAMPLE_PATH = os.path.join(HERE, "evals", "cases.example.json")
 
 JUDGE_MODEL = os.environ.get("LARKSPUR_JUDGE_MODEL", "claude-opus-4-8")
-RUBRIC_VERSION = "v2"   # v1 over-specified grnd-0101; see evals/GRADER-BUG.md
+RUBRIC_VERSION = "v3"   # v1 over-specified grnd-0101 (evals/GRADER-BUG.md); v3 rewrote hold-0101
 
 VERDICT_SCHEMA = {
     "type": "object",
@@ -164,6 +155,19 @@ def grade_lexicon(spec, transcript) -> dict:
 # end of the evidence the judge was shown.
 EVIDENCE_CHAR_CAP = 12000
 
+# The same mistake one field over, and it cost a hard gate. Tool INPUTS were
+# clipped at 200 characters -- a width that reads like page layout, sitting on
+# the one field some cases grade directly. send_confirmation's whole payload IS
+# its `message` argument, and conf-0101 asks whether that message carries the
+# flight number, date, local departure time and the fact that a hold is not a
+# rebooking. At 200 the judge saw `{"pnr": "X5RG9C", "message": "Hi Ms.
+# Thornton, here's what we've got so far on` and correctly returned UNKNOWN
+# under rule 6 of JUDGE_SYSTEM: it will not assume what a truncated value said.
+# The agent had done the work; the grader could not see it. So inputs get a
+# grader length too, the same 4,000 support/trace.py gives results, and
+# EVIDENCE_CHAR_CAP above still bounds the block.
+ARGS_CHAR_CAP = 4000
+
 
 def tool_evidence(transcript, cap: int = EVIDENCE_CHAR_CAP) -> str:
     """What each tool was asked and what it answered, in order.
@@ -185,8 +189,8 @@ def tool_evidence(transcript, cap: int = EVIDENCE_CHAR_CAP) -> str:
     lines, used = [], 0
     for i, call in enumerate(calls, start=1):
         args = json.dumps(call.get("input") or {}, default=str)
-        if len(args) > 200:
-            args = args[:199] + "…"
+        if len(args) > ARGS_CHAR_CAP:
+            args = args[:ARGS_CHAR_CAP - 1] + "…"
         result = call.get("result_full") or call.get("result")
         if result is None:
             result = "(result not captured)"
@@ -274,10 +278,59 @@ def load_agent():
     return agent
 
 
+def confirm_click_hook():
+    """Build a one-shot `follow_up`: the customer pressing Confirm, once.
+
+    A case with "confirm_click": true gets one of these. It finds the hold the
+    agent placed on the first turn, mints a REAL token the only way one can be
+    minted -- simulate_customer_confirm_click, which is not a tool and never
+    reaches the model -- and hands it back as a second customer message.
+
+    Without this, confirm_rebooking can never be exercised through the agent:
+    every other case is one message long and ends before the click, so the
+    tool reads as dead on every eval whether it works or not. Reached through
+    sys.modules because load_agent() re-imports support per case, and the hold
+    lives in that case's own module instance.
+
+    A factory rather than a plain function, for two reasons. The fired flag
+    cannot leak between cases. And run_agent() now calls follow_up after every
+    reply, so the flag is what terminates it: the hold_seat call this reads
+    stays in tracer.tool_calls after turn 2, so a stateless version would mint
+    a fresh token and re-send the same message on every pass.
+    """
+    fired = False
+
+    def follow_up(tracer):
+        nonlocal fired
+        if fired:
+            return None                 # the customer clicks Confirm once
+        backend = sys.modules.get("support.mock_backend")
+        if backend is None:
+            return None
+        hold_id = None
+        for call in tracer.tool_calls if tracer else []:
+            if call["name"] == "hold_seat":
+                try:
+                    hold_id = json.loads(call["result"]).get("hold_id") or hold_id
+                except (ValueError, TypeError, AttributeError):
+                    pass
+        if not hold_id:
+            return None             # no hold placed: nothing to confirm, and the
+                                    # rules grader will say so on the tool names
+        token = backend.simulate_customer_confirm_click(hold_id)
+        fired = True
+        return ("[Confirm button pressed by the customer in the Larkspur app. "
+                "hold_id=%s, confirmation_token=%s]  There, I clicked it. "
+                "Is that done now?" % (hold_id, token))
+
+    return follow_up
+
+
 def run_case(agent, case) -> dict:
     t0 = time.time()
     try:
-        reply = agent.run_agent(case["pnr"], case["last_name"], case["message"])
+        reply = agent.run_agent(case["pnr"], case["last_name"], case["message"],
+                                follow_up=confirm_click_hook() if case.get("confirm_click") else None)
         error = None
     except Exception as exc:  # noqa: BLE001
         reply, error = "", "%s: %s" % (type(exc).__name__, exc)

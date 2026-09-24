@@ -1,67 +1,37 @@
 #!/usr/bin/env python3
-"""An MCP server for two Larkspur lookups, written in the standard library only.
+"""An MCP server for two Larkspur lookups, standard library only.
 
-WHAT THIS IS, IN PLAIN WORDS
+An MCP server answers questions over its own stdin and stdout. It does not talk
+to Claude and does not know what a model is. A host launches it as a subprocess
+and does the talking; Claude Code is a host, and so is support/mcp_client.py.
 
-An MCP server is a small program that answers questions over its own stdin and
-stdout. It does not talk to Claude. It does not know what a model is. Something
-else, called the host, launches it as a subprocess and does the talking. Claude
-Code is a host. `support/mcp_client.py` is a host. Both drive this same file.
+The wire is one JSON object per line each way. Anything meant for a human goes
+to stderr -- a stray print on stdout is a protocol error, not a log line.
 
-The wire is one JSON object per line, in both directions. That is the whole
-transport. Requests go in on stdin, responses come out on stdout, and anything
-this file wants to say to a human goes to stderr, because a stray print on
-stdout is a protocol error, not a log line.
+The messages:
 
-THE MESSAGES YOU WILL SEE GO PAST
-
-Run the client with tracing on and you will watch these:
-
-    server/discover     who are you, what versions do you speak, what can you do
-    tools/list          give me every tool you have, with its JSON schema
-    tools/call          run this tool with these arguments, here is the answer
+    server/discover     who are you, what do you speak, what can you do
+    tools/list          every tool, with its JSON schema
+    tools/call          run this tool with these arguments
     ping                still there?
 
-Older hosts open with `initialize` and then a `notifications/initialized`
-notification instead of `server/discover`. This file answers both, because the
-protocol changed shape in the 2026-07-28 revision and real hosts are still
-mixed. See ERAS below.
-
-WHY THIS FILE EXISTS AT ALL
-
-The official `mcp` Python SDK needs Python 3.10. The exercise floor is 3.9.
-So this is written from the spec: no packages, no imports beyond the standard
-library and the exercise's own mock backend. About four hundred lines, most of
-them comments.
-
-THE POINT OF THE EXERCISE
-
-The two tools below are the SAME two functions the agent can already call in
-process. Nothing about the model's job changes. What changes is who owns the
-tool: a separate program, versioned on its own, reachable by any host. Watch
-the token count before and after. It does not move. MCP fixes what you
-maintain. It does nothing for routing.
-
-ERAS
+Two eras, and this file serves whichever the host opens with:
 
     modern (2026-07-28)   No handshake. Every request carries its protocol
-                          version in params._meta. The server answers each
-                          request on its own. `server/discover` is how a host
-                          asks what the server supports.
-    legacy (2025-11-25    An `initialize` request opens a session, the server
-      and earlier)        answers with its protocolVersion, capabilities and
-                          serverInfo, and the host follows up with a
-                          `notifications/initialized` notification.
+                          version in params._meta. server/discover asks what
+                          the server supports.
+    legacy (<= 2025-11-25) `initialize` opens a session; the host follows up
+                          with a notifications/initialized notification.
 
-This file is dual-era: it serves whichever one the host opens with.
+Written from the spec rather than the `mcp` SDK, which needs Python 3.10 where
+the exercise floor is 3.9.
 
-RUN IT
+The point: these two tools are the SAME functions the agent could already call
+in process. The model's job does not change and the token count does not move.
+MCP changes who owns and versions the tool. It does nothing for routing.
 
     python3 support/mcp_server.py --trace          # then type JSON at it
     python3 support/mcp_selftest.py                # the real check
-    MCP_TRACE=1 python3 support/mcp_server.py
-
-You will not normally run this by hand. A host runs it for you.
 """
 
 from __future__ import annotations
@@ -292,15 +262,14 @@ TOOLS: List[Dict[str, Any]] = [
         "name": "next_available_day",
         "title": "Earliest open seat",
         "description": (
-            "Answer the first question a cancelled or stranded Larkspur customer asks: "
-            "what is the soonest day you can actually get me out? Call it for questions "
-            "about DATES, when the customer wants to know how long they are stuck rather "
-            "than which specific flight to take. It needs the departure and arrival "
-            "airport codes, the date the customer was booked to travel, and the cabin. "
-            "It searches Larkspur inventory forward from that date and returns the "
-            "earliest date with an open seat as YYYY-MM-DD, or says plainly that there is "
-            "no open seat in the schedule it can see. It holds nothing and books nothing, "
-            "and it answers for a party of one."
+            "Find the soonest day Larkspur can actually fly this customer out.\n"
+            "When: the customer asks about DATES — how long they are stuck — rather "
+            "than which specific flight to take. Use search_alternatives instead when "
+            "they want options to choose between.\n"
+            "Returns: the earliest date with an open seat as YYYY-MM-DD, or a plain "
+            "statement that there is no open seat in the schedule it can see.\n"
+            "Rules: it searches forward from the date you pass, never backward. It "
+            "answers for a party of one, and it holds nothing and books nothing."
         ),
         "inputSchema": {
             "type": "object",
@@ -337,13 +306,13 @@ TOOLS: List[Dict[str, Any]] = [
         "title": "Handbook text",
         "description": (
             "Return the Larkspur Customer Commitment and fare rules text behind an "
-            "entitlement decision, straight from the published Handbook excerpt. Call it "
-            "when a customer challenges an answer and wants to know the rule, or asks "
-            "why something is or is not covered, so the reply can quote the Handbook "
-            "instead of paraphrasing it. It needs one section: a number, or any words "
-            "from the section title such as 'care while you wait'. It returns that "
-            "section's full text. It is reference reading, not an entitlements decision: "
-            "the policy table is still the only source of truth for what is owed."
+            "entitlement decision, straight from the published Handbook excerpt.\n"
+            "When: the customer challenges an answer and wants to know the rule, or "
+            "asks why something is or is not covered, so your reply can quote the "
+            "Handbook instead of paraphrasing it.\n"
+            "Returns: that section's full text.\n"
+            "Rules: this is reference reading, not an entitlements decision. "
+            "check_policy is still the only source of truth for what is owed."
         ),
         "inputSchema": {
             "type": "object",

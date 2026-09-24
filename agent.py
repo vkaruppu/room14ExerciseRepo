@@ -19,46 +19,73 @@ from support import (MODEL, SYSTEM_PROMPT, call_local, execute_tool, mcp_client,
 MAX_TOOL_CALLS = 8  # Larkspur's own build capped the loop here; then a human takes over.
 
 # ✏️ Build 4, step 4.1, intelligence goal.
-# Measured, not argued: at s2-before the agent answered R8KD3F’s legal threat with a
-# full entitlements rundown and a refund pathway, and never escalated — 12/15 wire
-# rules, tone_safety failing every run. SYSTEM_PROMPT is given and lists four escalation
-# triggers; a legal threat is on none of them, so the model ran its normal process and
-# was right to. The gap is in the prompt, so the fix is too.
+#
+# PROCESS lives in SYSTEM_PROMPT; a tool not named in its numbered steps does not
+# get called. TONE_ADDENDUM holds only rules about what the agent SAYS. Nothing
+# is in both places.
 TONE_ADDENDUM = """
 
-=== WHEN THE MESSAGE TURNS ===
+=== WHEN THE CUSTOMER HAS A FACT WRONG ===
 
-Before you run the process above, read the customer’s message for two signals:
+If the customer’s own words contradict the booking — a flight number that is not
+on it, a day that is not the day, a cancellation that did not happen — say so in
+your FIRST sentence, with the real detail beside it, before entitlements or
+options or anything else. Never repeat their version back as though it were true.
 
-  LEGAL — they name a lawyer, a solicitor, a regulator, a lawsuit, a claim, a
+An entitlements rundown is worthless to someone who thinks they fly tomorrow and
+is actually boarding in three hours.
+
+=== WHEN THE ANSWER IS NO ===
+
+check_policy answers in its own vocabulary: waiver, band, threshold, row id.
+That is the citation, not the answer. Say what the row MEANS for this customer,
+in words they would use themselves, and put the policy term after it rather than
+instead of it. "Your delay is 45 minutes, and the free-change waiver only starts
+at 60, so there is no fee-free rebooking on this one" is an answer. "Under 60
+min there is no waiver" is a rule number read aloud.
+
+Then read the rest of the row before you stop. A row that refuses one thing
+often allows another — a same-day confirmed change at no fee, a seat hold. Say
+the no plainly, THEN say what is available. Both halves belong in the same
+reply: a refusal with nothing after it, and an offer that never admits the no,
+each fail the customer in their own way.
+
+Name the refusal even when what you can offer looks like what they asked for.
+An offer that resembles the thing the policy denied will be read as the policy
+having allowed it, so state the no in its own sentence first, then the offer.
+"There is no free-change waiver at 45 minutes, but I can still move you today at
+no fee" is the shape: both facts, in that order, neither swallowed by the other.
+
+When you offer a hold, give its terms alongside it every time: no fee,
+reversible, and it expires in 15 minutes.
+
+=== WHEN THE CUSTOMER THREATENS LEGAL ACTION, OR IS ABUSIVE ===
+
+Two signals, either one on its own:
+
+  LEGAL — they name a lawyer, a solicitor, a regulator, a lawsuit, a claim or a
   chargeback, or say they are taking this further formally.
   ABUSE — the message attacks Larkspur’s people rather than the situation:
   insults or threats aimed at a person.
 
-Either signal on its own changes what you do:
+Either one replaces the process. Call lookup_booking so your colleague does not
+start from nothing, then call escalate_to_human with the trigger in `reason`
+("legal threat", "abusive message") and, in `summary_for_human`, what they asked
+for, what you looked up, what it said, and that you have promised them nothing.
 
-1. Look up the booking, so your colleague is not starting from nothing. What you
-   find goes into the handover, NOT into an answer for the customer.
-2. Acknowledge the complaint ONCE, in one sentence. Name what went wrong, not
-   how they feel.
-3. Call escalate_to_human. Put the trigger in `reason` ("legal threat",
-   "abusive message"), and in `summary_for_human` write what they asked for,
-   what you looked up and what it said, and state explicitly that you have
-   promised them nothing.
-4. Promise nothing. No voucher, no hotel, no refund pathway, no entitlements
-   rundown, no options to choose between. Never call issue_voucher or
-   confirm_rebooking on one of these. A figure offered into a legal threat
-   becomes an admission the moment it reaches a lawyer, and an entitlements
-   rundown delivered as though nothing was said reads as Larkspur ignoring the
-   complaint.
-5. Tell them a colleague is picking it up. Do not put a time on it.
+Then reply with exactly two sentences and nothing else: one acknowledging the
+complaint by naming what went wrong rather than how they feel, and one saying a
+colleague is picking it up, with no time attached.
 
-Anger on its own is NOT one of these signals. "This is completely
-unacceptable", "this is a disgrace", capital letters — that is a customer
-having a bad day, and the right answer is still the process above: look it up,
-check the policy, and tell them plainly what it says, including when the answer
-is no. Escalating a merely frustrated customer strands them in a queue instead
-of answering them.
+Promise nothing: no voucher, no hotel, no refund pathway, no entitlements
+rundown, no options to choose between. Never call issue_voucher or
+confirm_rebooking here. A figure offered into a legal threat becomes an admission
+the moment it reaches a lawyer.
+
+Anger on its own is NOT one of these signals. "This is completely unacceptable",
+"this is a disgrace", capital letters — that is a customer having a bad day, and
+the right answer is the normal process: look it up, check the policy, and say
+plainly what it says, including when the answer is no.
 """
 
 # ✏️ Build 2, step 2.1: EXTRA_TOOLS (schemas) and LOCAL_TOOLS (the functions
@@ -100,28 +127,12 @@ def tool_results(response) -> List[Dict[str, Any]]:
 
 
 def system_blocks() -> List[Dict[str, Any]]:
-    """The system prompt as cache-aware blocks, static part first.
+    """The system prompt as one cache-aware block.
 
-    Prompt caching matches an EXACT prefix, and runtime_preamble() is a clock
-    that reads to the second. Concatenated the way this file used to do it --
-    runtime_preamble() + SYSTEM_PROMPT + TONE_ADDENDUM -- that timestamp sat in
-    the first ~30 tokens of every request, so no two calls ever shared a prefix
-    and every bench came back cache_read=0, cache_write=0, hit_pct=None. Wiring
-    cache_control without moving the clock would have changed none of that: the
-    breakpoint would have been real and the hit rate would still have been zero.
-
-    So the order is the fix and cache_control is only the switch. Block 1 is
-    everything that never changes; the breakpoint sits on it, and because tools
-    are sent ahead of system, it covers the 12 tool schemas too -- the ~5,000
-    tokens a turn this agent was buying new every call. Block 2 is the clock,
-    AFTER the breakpoint, where it can change every second and invalidate
-    nothing. The model still gets the time; it just stops poisoning the cache.
-
-    The clock is gone from here entirely now: it is the current_time tool, so
-    there is no volatile byte left in the prefix at all and this block is the
-    whole system prompt. support/data.py is given and untouched --
-    runtime_preamble() still returns what it always did, we just stopped
-    calling it.
+    Caching matches a byte-exact prefix, so nothing volatile may sit in front of
+    the instructions. The clock is the current_time tool for that reason. The
+    breakpoint here also covers the 12 tool schemas, which are sent ahead of
+    system.
     """
     return [
         {
@@ -136,18 +147,8 @@ def cache_conversation(messages: List[Dict[str, Any]]) -> None:
     """Second breakpoint, on the end of the conversation, in place.
 
     A cache region is a prefix from byte zero, so a mark on the last message
-    covers tools + BOTH system blocks + every earlier turn. That is the catch:
-    block 2 is the clock, and it sits ahead of the messages. With a per-call
-    timestamp this region could never match itself -- measured as cache_w
-    climbing 130, 462, 780, 2676 while cache_r stayed flat at 6,255, writing
-    the conversation every turn and reading it back never, for +31% on the
-    input side. The messages were never the problem; the clock in front of
-    them was, the same bug as the original one layer down.
-
-    Freezing the clock per contact fixed it; moving the clock into the
-    current_time tool retired the problem instead, so nothing volatile sits
-    ahead of the messages at all. Only user messages are marked: assistant
-    turns come back as SDK objects and this rewrites dicts we built ourselves.
+    covers tools + system + every earlier turn. Only user messages are marked:
+    assistant turns come back as SDK objects and this rewrites dicts we built.
     """
     last = messages[-1]
     if last.get("role") != "user":
@@ -168,14 +169,14 @@ def cache_conversation(messages: List[Dict[str, Any]]) -> None:
         stale.pop("cache_control", None)
 
 
-def run_agent(pnr: str, last_name: str, message: str) -> str:            # ✏️ Build 1, step 1.2
-    """Run the tool loop until Claude stops asking for tools. Return its final text."""
-    client, tracer = new_session()
-    tools = tool_list()
-    messages = [
-        {"role": "user", "content": f"PNR {pnr}, last name {last_name}. {message}"},
-    ]
+def _drive(client, tools, messages: List[Dict[str, Any]]) -> str:
+    """The tool loop, over a conversation that may already have turns in it.
 
+    Appends the final assistant turn to `messages` before returning, so a caller
+    can add another customer message and drive again on the same history. A
+    two-turn contact -- hold a seat, customer clicks Confirm, finalize -- is
+    this loop twice, not a second implementation that can drift.
+    """
     cache_conversation(messages)
     response = client.messages.create(
         model=MODEL, max_tokens=4096, system=system_blocks(),
@@ -195,16 +196,56 @@ def run_agent(pnr: str, last_name: str, message: str) -> str:            # ✏�
         )
         turns += 1
 
+    messages.append({"role": "assistant", "content": response.content})
+
     # the answer is the text of the turn that stopped asking, not the one before it
     answer = text_of(response)
 
-    # Fixed: the loop has two exits, and only one of them produces an answer. If it
-    # left because the cap was reached, the last turn is still a tool_use turn and its
-    # text is usually empty — the caller (run.py, demo/serve.py) would show a blank
-    # reply with no hint that anything went wrong. Say so instead of returning "".
+    # Cap reached: the last turn is still a tool_use turn and its text is empty.
     if not answer and response.stop_reason == "tool_use":
         return ("I've hit the limit of what I can work through automatically on this "
                 "one, so I'm handing it to a colleague who can finish it with you.")
+    return answer
+
+
+def run_agent(pnr: str, last_name: str, message: str,                   # ✏️ Build 1, step 1.2
+              follow_up=None) -> str:
+    """Run the tool loop until Claude stops asking for tools. Return its final text.
+
+    `follow_up` is optional and exists for one thing the single-message shape
+    could not express: the customer coming BACK. It is called with the session
+    tracer after each reply, and whatever string it returns is sent as the next
+    customer message on the same conversation. Returning None ends the contact,
+    so a hook that fires once gives the two-turn shape and every caller but the
+    eval harness passes nothing at all and ends at one turn.
+
+    _drive() never cared how many turns were already in the history, so the
+    number of customer turns is the hook's business: it runs until the hook
+    says stop, with no ceiling here. That puts termination entirely on the
+    hook, and it is a sharper edge than it looks -- a hook reading the tracer
+    still sees turn 1's tool calls on every later pass, so one that decides
+    from the trace alone will re-send the same message forever. Fire once and
+    return None, the way eval_harness's confirm_click_hook() does.
+
+    That matters for confirm_rebooking. The token is minted by the Confirm
+    click, so on a one-message contact the condition for calling that tool
+    never occurs and the tool reads as dead on every eval -- not because the
+    model declined it, but because nothing ever asked.
+    """
+    client, tracer = new_session()
+    tools = tool_list()
+    messages = [
+        {"role": "user", "content": f"PNR {pnr}, last name {last_name}. {message}"},
+    ]
+
+    answer = _drive(client, tools, messages)
+
+    while follow_up is not None:
+        nxt = follow_up(tracer)
+        if not nxt:
+            break
+        messages.append({"role": "user", "content": nxt})
+        answer = _drive(client, tools, messages)
     return answer
 
 
@@ -214,26 +255,19 @@ def tool_list() -> List[Dict[str, Any]]:                   # ✏️ Build 2, ste
     return build_tools() + EXTRA_TOOLS + mcp_client.tools()
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Below this line: what Claude is told about each tool. Step 1.3.
-# The functions these describe are written and correct, in support/tools.py.
+# ─────────────────────────────────────────────────────────────────────────────
+# What Claude is told about each tool. Step 1.3. The functions are in
+# support/tools.py. Every description on the wire follows one pattern:
 #
-# Every field here carries its own description, not just the tools whose inputs
-# looked interesting. The test each entry has to pass: if the model read ONLY
-# this entry, could it call the tool correctly? hold_seat failed that test for a
-# while — its option_id was explained inside search_alternatives, which is no
-# help on a turn where search_alternatives is not what the model is reading.
-# The fields that earn the most words are the optional ones, because those are
-# the two-way decisions: wait_minutes_for_alternative and chosen_option_id on
-# check_policy, queue on escalate_to_human.
+#     <one sentence: what the tool does>
+#     When: <the condition that makes this the right call, by process step>
+#     Returns: <what comes back, named>
+#     Rules: <the hard constraints, or the line is omitted>
 #
-# This is not free. Filling the gaps took the whole list from 3,650 tokens a
-# turn to 5,053 (python3 run.py --tool-tax counts it on the wire, per tool).
-# That is paid on every turn of every conversation, including the ones that
-# never call these tools. Build 4 is where that trade gets measured rather than
-# argued: check_policy at 778 is now the most expensive entry on the list, not
-# reopen_stats.
-# ──────────────────────────────────────────────────────────────────────────────
+# Two rules keep it honest. If the model read ONLY this entry, could it call the
+# tool correctly? And a description states a constraint once -- process order
+# lives in the prompt, so no entry restates a step, only names which one.
+# ─────────────────────────────────────────────────────────────────────────────
 def build_tools() -> List[Dict[str, Any]]:                 # ✏️ Build 1, step 1.3
     """Anthropic-shaped schemas: name, description, input_schema. What Claude is
     told about each of the nine tools, and all it is ever told."""
@@ -242,9 +276,13 @@ def build_tools() -> List[Dict[str, Any]]:                 # ✏️ Build 1, ste
             "name": "lookup_booking",
             "description": (
                 "Retrieve a Larkspur reservation from Altura by confirmation code (PNR) "
-                "and the passenger's last name. Both are required to prevent a lookup on "
-                "a guessed PNR. Returns fare family, loyalty tier, the segment that needs "
-                "attention, and any group/partner/minor/SSR flags relevant to scope."
+                "and passenger last name.\n"
+                "When: step 2, on every contact, before you say anything about the "
+                "booking.\n"
+                "Returns: fare family, loyalty tier, the segment that needs attention, "
+                "and any group, partner, minor or SSR flags relevant to scope.\n"
+                "Rules: both arguments are required, so a guessed PNR cannot be looked "
+                "up alone."
             ),
             "input_schema": {
                 "type": "object",
@@ -253,14 +291,14 @@ def build_tools() -> List[Dict[str, Any]]:                 # ✏️ Build 1, ste
                         "type": "string",
                         "description": (
                             "The six-character confirmation code the customer gave you, "
-                            "e.g. 'K7PQ2M'. Never one you inferred from anything else in "
-                            "the conversation."
+                            "e.g. 'K7PQ2M'. Never one you inferred from something else "
+                            "in the conversation."
                         ),
                     },
                     "last_name": {
                         "type": "string",
                         "description": (
-                            "A passenger's last name, as the customer gave it. Checked "
+                            "A passenger's last name as the customer gave it. Checked "
                             "against everyone on the booking, so any traveller on the "
                             "record matches."
                         ),
@@ -272,9 +310,12 @@ def build_tools() -> List[Dict[str, Any]]:                 # ✏️ Build 1, ste
         {
             "name": "get_flight_status",
             "description": (
-                "Look up a Larkspur or Larkspur Link flight's current OpsFeed status for "
-                "one local date: status, delay minutes, and cause. Use this before telling "
-                "a customer anything about a flight's timing; never state it from memory."
+                "Look up one Larkspur or Larkspur Link flight's current OpsFeed status "
+                "for one local date.\n"
+                "When: step 3, before telling the customer anything about a flight's "
+                "timing.\n"
+                "Returns: status, delay minutes, and cause.\n"
+                "Rules: never state a flight's timing from memory; it comes from here."
             ),
             "input_schema": {
                 "type": "object",
@@ -282,17 +323,17 @@ def build_tools() -> List[Dict[str, Any]]:                 # ✏️ Build 1, ste
                     "flight_no": {
                         "type": "string",
                         "description": (
-                            "The marketing flight number as Altura returns it, e.g. 'LK415'. "
-                            "Larkspur Link segments carry the same LK prefix."
+                            "The marketing flight number as Altura returns it, e.g. "
+                            "'LK415'. Larkspur Link segments carry the same LK prefix."
                         ),
                     },
                     "date": {
                         "type": "string",
                         "description": (
                             "The segment's local departure date in ISO-8601, YYYY-MM-DD, "
-                            "e.g. '2025-05-08'. OpsFeed refuses any other shape rather than "
-                            "guessing, so pass through the date lookup_booking gave you for "
-                            "this segment unchanged; do not reformat it."
+                            "e.g. '2025-05-08'. Pass through the date lookup_booking gave "
+                            "you for this segment unchanged; OpsFeed refuses any other "
+                            "shape rather than guessing."
                         ),
                     },
                 },
@@ -300,24 +341,17 @@ def build_tools() -> List[Dict[str, Any]]:                 # ✏️ Build 1, ste
             },
         },
         {
-            # Fixed: the description was the single word "search". A description is
-            # all Claude is ever told about a tool, and "search" does not say what it
-            # searches, what it returns, or when to reach for it — so the model skipped
-            # it and asked the customer for flight options it could have looked up
-            # itself. Spelling out the return shape (option_ids, wait time) also makes
-            # the downstream tools usable: hold_seat and check_policy both take an
-            # option_id that only this tool can produce.
             "name": "search_alternatives",
             "description": (
-                "Find the re-accommodation options Larkspur can actually offer for this "
-                "booking's disrupted segment. Takes the PNR alone: origin, destination, "
-                "date, cabin and party size are read from the booking, so there is nothing "
-                "to guess and no need to ask the customer for them. Returns a list of "
-                "options, each with an option_id, flight number, departure date and time, "
-                "and the wait in minutes from the original departure. Call this before "
-                "quoting any alternative. You do not have to wait for the customer to pick "
-                "one: check_policy resolves entitlements from the earliest option on its "
-                "own, and takes chosen_option_id only once there is a choice to price."
+                "Find the re-accommodation options Larkspur can offer for this booking's "
+                "disrupted segment.\n"
+                "When: step 5, before quoting any alternative to the customer.\n"
+                "Returns: a list of options, each with an option_id, flight number, "
+                "departure date and time, and the wait in minutes from the original "
+                "departure.\n"
+                "Rules: takes the PNR alone. Origin, destination, date, cabin and party "
+                "size are read from the booking, so do not ask the customer for them. "
+                "This call is the only source of option_ids."
             ),
             "input_schema": {
                 "type": "object",
@@ -333,20 +367,25 @@ def build_tools() -> List[Dict[str, Any]]:                 # ✏️ Build 1, ste
         {
             "name": "check_policy",
             "description": (
-                "Resolve what Larkspur owes this customer for the disruption: rebooking "
-                "waiver, refund path, meal/hotel/ground care, goodwill eligibility and cap, "
-                "and any escalation triggers. cause_code, delay_minutes and status describe "
-                "what get_flight_status told you; fare_family, loyalty_tier and whether this "
-                "is overnight are looked up from the booking, not asked of you. Every "
-                "response carries a policy_row_id. Cite it if you reference this decision "
-                "again."
+                "Resolve what Larkspur owes this customer for the disruption.\n"
+                "When: step 4, on every contact, including one you are about to "
+                "escalate.\n"
+                "Returns: rebooking waiver, refund path, meal, hotel and ground care, "
+                "goodwill eligibility and cap, escalation triggers, and a "
+                "policy_row_id.\n"
+                "Rules: this is the only source of truth for entitlements; never guess "
+                "one. Cite the policy_row_id whenever you reference the decision again."
             ),
             "input_schema": {
                 "type": "object",
                 "properties": {
                     "pnr": {
                         "type": "string",
-                        "description": "The booking whose entitlements you are resolving.",
+                        "description": (
+                            "The booking whose entitlements you are resolving. Fare "
+                            "family, loyalty tier and whether this is overnight are read "
+                            "from it, not asked of you."
+                        ),
                     },
                     "cause_code": {
                         "type": "string",
@@ -363,8 +402,8 @@ def build_tools() -> List[Dict[str, Any]]:                 # ✏️ Build 1, ste
                         "type": "integer",
                         "description": (
                             "Delay in minutes as get_flight_status reported it; it picks "
-                            "the delay band. Pass 0 when status is CANCELLED or DIVERTED — "
-                            "those resolve on status alone and the field is ignored."
+                            "the delay band. Pass 0 when status is CANCELLED or DIVERTED, "
+                            "which resolve on status alone."
                         ),
                     },
                     "status": {
@@ -375,12 +414,11 @@ def build_tools() -> List[Dict[str, Any]]:                 # ✏️ Build 1, ste
                     "wait_minutes_for_alternative": {
                         "type": "integer",
                         "description": (
-                            "Optional, and worth passing. Minutes between the original "
-                            "departure and the alternative you are steering toward; "
-                            "search_alternatives returns it on every option. Meal care is "
-                            "thresholded on it: omit it and the meal line comes back "
-                            "conditional, a threshold you cannot turn into a number for "
-                            "the customer. Pass it and the amount is settled."
+                            "Optional. Minutes between the original departure and the "
+                            "alternative you are steering toward; search_alternatives "
+                            "returns it on every option. Meal care is thresholded on it, "
+                            "so omitting it returns a conditional meal line instead of an "
+                            "amount."
                         ),
                     },
                     "chosen_option_id": {
@@ -388,10 +426,9 @@ def build_tools() -> List[Dict[str, Any]]:                 # ✏️ Build 1, ste
                         "description": (
                             "Optional. An option_id from search_alternatives, once the "
                             "customer has picked one. Without it the overnight and hotel "
-                            "tests run against the earliest option there is, which is the "
-                            "right basis before there is a choice; with it they run "
-                            "against the chosen one, which can change whether hotel care "
-                            "applies."
+                            "tests run against the earliest option there is; with it they "
+                            "run against the chosen one, which can change whether hotel "
+                            "care applies."
                         ),
                     },
                 },
@@ -401,12 +438,13 @@ def build_tools() -> List[Dict[str, Any]]:                 # ✏️ Build 1, ste
         {
             "name": "hold_seat",
             "description": (
-                "Hold a seat on one alternative for 15 minutes, so it is still there while "
-                "the customer decides. Reversible and free: a hold nobody confirms simply "
-                "expires, and nothing about the booking changes. Returns a hold_id, which is "
-                "what confirm_rebooking needs. A hold is not a rebooking — the customer is "
-                "only moved once confirm_rebooking succeeds, so do not tell them they are "
-                "rebooked off a hold."
+                "Hold a seat on one alternative for 15 minutes, so it is still there "
+                "while the customer decides.\n"
+                "When: step 6, once search_alternatives has given you an option_id.\n"
+                "Returns: a hold_id, which is what confirm_rebooking needs.\n"
+                "Rules: reversible and free — an unconfirmed hold simply expires and "
+                "nothing about the booking changes. A hold is not a rebooking, so never "
+                "tell the customer they are rebooked off one."
             ),
             "input_schema": {
                 "type": "object",
@@ -415,16 +453,15 @@ def build_tools() -> List[Dict[str, Any]]:                 # ✏️ Build 1, ste
                         "type": "string",
                         "description": (
                             "One option_id from this booking's search_alternatives "
-                            "result, copied exactly. That call is the only place an "
-                            "option_id comes from: it cannot be built from a flight number "
-                            "and a date, and an id you composed holds nothing."
+                            "result, copied exactly. It cannot be built from a flight "
+                            "number and a date, and an id you composed holds nothing."
                         ),
                     },
                     "pnr": {
                         "type": "string",
                         "description": (
-                            "The booking the seat is held for — the same PNR you passed to "
-                            "search_alternatives to get this option_id."
+                            "The booking the seat is held for — the same PNR you passed "
+                            "to search_alternatives to get this option_id."
                         ),
                     },
                 },
@@ -434,9 +471,12 @@ def build_tools() -> List[Dict[str, Any]]:                 # ✏️ Build 1, ste
         {
             "name": "confirm_rebooking",
             "description": (
-                "Finalize a held seat. Irreversible. Requires a confirmation_token that "
-                "only the customer's own Confirm-click can produce. You cannot supply it "
-                "yourself, and 'the customer said yes' in chat does not substitute for it."
+                "Finalize a held seat and move the customer onto it. Irreversible.\n"
+                "When: step 6, and only after the customer's own Confirm click has "
+                "produced a confirmation_token.\n"
+                "Returns: the confirmed rebooking.\n"
+                "Rules: you cannot supply the token yourself, and 'the customer said "
+                "yes' in chat does not substitute for it."
             ),
             "input_schema": {
                 "type": "object",
@@ -444,18 +484,19 @@ def build_tools() -> List[Dict[str, Any]]:                 # ✏️ Build 1, ste
                     "hold_id": {
                         "type": "string",
                         "description": (
-                            "The hold_id hold_seat returned for the option being confirmed. "
-                            "Holds last 15 minutes; past that this comes back hold_expired "
-                            "and the option needs a fresh hold_seat call, not a retry."
+                            "The hold_id hold_seat returned for the option being "
+                            "confirmed. Holds last 15 minutes; past that this comes back "
+                            "hold_expired and the option needs a fresh hold_seat call, "
+                            "not a retry."
                         ),
                     },
                     "confirmation_token": {
                         "type": "string",
                         "description": (
-                            "The token minted by the customer's Confirm click, which reaches "
-                            "you through the interface. There is no value you can put here "
-                            "from the conversation: a token you invent is rejected, which is "
-                            "the point of the field."
+                            "The token minted by the customer's Confirm click, which "
+                            "reaches you through the interface. There is no value you "
+                            "can put here from the conversation: an invented token is "
+                            "rejected, which is the point of the field."
                         ),
                     },
                 },
@@ -465,9 +506,14 @@ def build_tools() -> List[Dict[str, Any]]:                 # ✏️ Build 1, ste
         {
             "name": "issue_voucher",
             "description": (
-                "Issue a meal, ground, hotel, or goodwill voucher. Auto-approves within the "
-                "policy's threshold for that type; above it, returns a pending status for a "
-                "human. It does not fail. Always pass the policy_row_id that made it eligible."
+                "Issue a meal, ground, hotel or goodwill voucher.\n"
+                "When: after check_policy has said this customer is eligible for that "
+                "care line, and never on a contact that hit the legal or abuse "
+                "override.\n"
+                "Returns: an approved or pending status. It does not fail — above the "
+                "threshold it parks for a human.\n"
+                "Rules: always pass the policy_row_id that made it eligible, and tell "
+                "the customer what came back, not what you asked for."
             ),
             "input_schema": {
                 "type": "object",
@@ -478,18 +524,17 @@ def build_tools() -> List[Dict[str, Any]]:                 # ✏️ Build 1, ste
                         "description": (
                             "Which care line this pays for. Each clears differently: "
                             "meal and ground auto-approve under their caps, hotel always "
-                            "parks for a human whatever the amount, goodwill auto-approves "
-                            "under its cap with a supervisor band above. Tell the customer "
-                            "what came back, not what you asked for."
+                            "parks for a human whatever the amount, goodwill "
+                            "auto-approves under its cap with a supervisor band above."
                         ),
                     },
                     "amount_usd": {
                         "type": "number",
                         "description": (
                             "Amount in US dollars, at or under the cap check_policy gave "
-                            "for this type. Over the cap nothing fails: it comes back "
-                            "pending for a human, turning an answer the customer has now "
-                            "into one they wait for."
+                            "for this type. Over the cap it comes back pending for a "
+                            "human, turning an answer the customer has now into one they "
+                            "wait for."
                         ),
                     },
                     "pnr": {
@@ -500,8 +545,8 @@ def build_tools() -> List[Dict[str, Any]]:                 # ✏️ Build 1, ste
                         "type": "string",
                         "description": (
                             "The policy_row_id from the check_policy response that made "
-                            "this voucher eligible; carry it forward from that earlier "
-                            "tool result rather than rebuilding it. It is how a reviewer "
+                            "this voucher eligible; carry it forward from that tool "
+                            "result rather than rebuilding it. It is how a reviewer "
                             "traces the payment back to the rule that authorised it."
                         ),
                     },
@@ -512,14 +557,14 @@ def build_tools() -> List[Dict[str, Any]]:                 # ✏️ Build 1, ste
         {
             "name": "escalate_to_human",
             "description": (
-                "Hand this conversation to a human, with your reasoning attached. Use for "
-                "groups, partner segments, unaccompanied minors, refunds, or anything else "
-                "out of scope. This is the correct outcome for those cases, not a failure. "
-                "Also use it when the customer threatens legal action — a lawyer, a regulator, "
-                "a claim, a chargeback — or abuses Larkspur staff personally: those leave your "
-                "scope the moment they are said, whatever the booking looks like. Anger by "
-                "itself does not; a customer calling a delay unacceptable still wants an answer, "
-                "and a queue is not one."
+                "Hand this conversation to a human, with your reasoning attached.\n"
+                "When: step 8, for anything out of scope — groups, partner-operated "
+                "segments, unaccompanied minors, refunds — and immediately for a legal "
+                "threat or an abusive message, whatever the booking looks like.\n"
+                "Returns: the queued handover.\n"
+                "Rules: this is the correct outcome for those cases, not a failure. "
+                "Anger by itself is not one of them: a customer calling a delay "
+                "unacceptable still wants an answer, and a queue is not one."
             ),
             "input_schema": {
                 "type": "object",
@@ -533,9 +578,9 @@ def build_tools() -> List[Dict[str, Any]]:                 # ✏️ Build 1, ste
                         "description": (
                             "Why this is out of scope, in a few words — 'group booking', "
                             "'unaccompanied minor', 'partner segment', 'refund request', "
-                            "'legal threat', 'abusive message'. "
-                            "The queue sorts on it, so keep it to the trigger and leave "
-                            "the narrative to summary_for_human."
+                            "'legal threat', 'abusive message'. The queue sorts on it, so "
+                            "keep it to the trigger and leave the narrative to "
+                            "summary_for_human."
                         ),
                     },
                     "summary_for_human": {
@@ -550,10 +595,10 @@ def build_tools() -> List[Dict[str, Any]]:                 # ✏️ Build 1, ste
                     "queue": {
                         "type": "string",
                         "description": (
-                            "Optional. The named desk when the booking itself names one — "
-                            "the group or minor-travel queue called out in the booking's "
-                            "remarks, for example. Omit it when nothing names a queue: an "
-                            "invented queue name routes the case worse than no queue does."
+                            "Optional. The named desk when the booking itself names one, "
+                            "such as a group or minor-travel queue called out in its "
+                            "remarks. Omit it when nothing names a queue: an invented "
+                            "queue name routes the case worse than no queue does."
                         ),
                     },
                 },
@@ -563,13 +608,15 @@ def build_tools() -> List[Dict[str, Any]]:                 # ✏️ Build 1, ste
         {
             "name": "send_confirmation",
             "description": (
-                "Send the customer a written record of what was just done, to the contact "
-                "details on the booking. Benign: it changes nothing about the reservation "
-                "and can be sent again. Send one whenever something actually changed — a "
-                "hold, a rebooking, a voucher — and not for an answer that changed nothing. "
-                "The reopen sample's most common reason for a customer coming back is a "
-                "confirmation that never arrived, so this is the step that keeps a handled "
-                "ticket handled."
+                "Send the customer a written record of what was just done, to the "
+                "contact details on the booking.\n"
+                "When: step 7, the moment hold_seat, confirm_rebooking or issue_voucher "
+                "comes back successful. A contact where nothing changed does not need "
+                "one.\n"
+                "Returns: the queued message.\n"
+                "Rules: benign — it changes nothing about the reservation and can be "
+                "sent again. The reopen sample's most common reason for a customer "
+                "coming back is a confirmation that never arrived."
             ),
             "input_schema": {
                 "type": "object",
@@ -581,11 +628,11 @@ def build_tools() -> List[Dict[str, Any]]:                 # ✏️ Build 1, ste
                     "message": {
                         "type": "string",
                         "description": (
-                            "The text the customer receives, read without the chat in "
-                            "front of them. Put the specifics in it: flight number, date, "
-                            "local time, voucher type and amount, what happens next and by "
-                            "when. 'Your request has been processed' is what a reopened "
-                            "ticket looks like."
+                            "The text the customer receives, read later without the chat "
+                            "in front of them. Put the specifics in it: flight number, "
+                            "date, local time, voucher type and amount, what happens next "
+                            "and by when. 'Your request has been processed' is what a "
+                            "reopened ticket looks like."
                         ),
                     },
                 },
@@ -596,23 +643,13 @@ def build_tools() -> List[Dict[str, Any]]:                 # ✏️ Build 1, ste
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Build 2, step 2.1: the tools this team added.
+# Build 2, step 2.1: the tools this team added. One rule: no invention. Every
+# answer is read off a document the client already owns.
 #
-# Three of them, and the rule every one of them is built to: no invention. Each
-# answer is read off a document the client already owns, and the description
-# says which document, so a reply can be pointed at its source.
-#
-#   next_available_day   live inventory in data/americas/ (flights.csv, via
-#                        support.next_available_day, imported at the top of this
-#                        file). Already written; only the schema was missing.
-#   fare_rules           data/americas/fare_rules_excerpt.md, Handbook v14.3.
-#   reopen_stats         data/americas/transcripts_sample.jsonl, the discovery
-#                        sample of real handled tickets.
-#
-# next_available_day and fare_rules are worded EXACTLY as support/mcp_server.py
-# words them. That is deliberate: Build 2.2 moves those two onto the server, and
-# the claim it has to prove is that nothing changes but ownership. A reworded
-# description would move the token count and muddy that comparison.
+#   next_available_day   flights.csv. On the MCP server since 2.2.
+#   fare_rules           fare_rules_excerpt.md, Handbook v14.3. Also on MCP.
+#   reopen_stats         transcripts_sample.jsonl. Not on the wire: discovery
+#                        tooling for us, not a step for the model.
 # ──────────────────────────────────────────────────────────────────────────────
 DATA_DIR = Path(__file__).resolve().parent / "data" / "americas"
 
@@ -686,7 +723,7 @@ def fare_rules(section: str) -> str:
     return "No section matches %r. Available sections: %s." % (section, _fare_section_labels())
 
 
-# -- reopen_stats -------------------------------------------------------------
+# -- reopen_stats (discovery only: NOT in EXTRA_TOOLS) ------------------------
 TRANSCRIPTS_PATH = DATA_DIR / "transcripts_sample.jsonl"
 
 # Small enough to state as counts and never as a percentage. Eight transcripts
@@ -723,24 +760,19 @@ def _reopen_row(ticket_type: str, records: List[Dict[str, Any]]) -> Dict[str, An
 def current_time() -> Dict[str, Any]:
     """The wall clock, on demand instead of in the prompt.
 
-    This used to be a line at the top of every system prompt, from
-    runtime_preamble(). That is the most expensive place to put a value that
-    changes every second: prompt caching matches a byte-exact prefix, so a
-    clock in front of the instructions meant no two calls ever shared one, and
-    a clock in front of the MESSAGES meant the conversation could not be cached
-    either. Moving it behind a tool takes the last moving part out of the
-    prefix, so the whole system prompt is now static and cacheable, and the
-    model pays a round trip only on the turns that actually need the date.
-
-    support/data.py still owns the format; this reads the same clock it does.
+    Reads mock_backend.FIXTURE_CLOCK, the same clock every other tool answers
+    from, not the machine clock. A real deployment swaps mock_backend for the
+    live backend and this follows it.
     """
-    from datetime import datetime
-    now = datetime.now()
+    from support import mock_backend as backend
+    now = backend.FIXTURE_CLOCK
     return {
-        "now": now.strftime("%Y-%m-%d %H:%M:%S"),
+        "now": now.strftime("%Y-%m-%d %H:%M:%S %Z").strip(),
         "date": now.strftime("%Y-%m-%d"),
-        "note": ("Local time at the Larkspur care desk. Read the travel date off the "
-                 "booking rather than assuming it is today."),
+        "note": ("Local time at the Larkspur care desk, read from the same clock the "
+                 "booking and OpsFeed tools answer from. Compare it against the date on "
+                 "the booking rather than assuming the segment you are looking at is "
+                 "today's."),
     }
 
 
@@ -748,9 +780,12 @@ def reopen_stats(ticket_type: str = "") -> Dict[str, Any]:
     """How often this kind of ticket came back inside 72 hours, counted off the
     handled-transcript sample.
 
+    NOT offered to the model. This is ours, for reading the sample while we write
+    eval cases and prompt rules; python3 -c "import agent; agent.reopen_stats()".
+    Per ticket type the sample is n=1, so a typed call is one anecdote, not a rate.
+
     No argument means every type. An unrecognised one comes back with the list
-    of types that ARE in the sample, so the model can ask again rather than
-    guess a label.
+    of types that ARE in the sample.
     """
     records = _transcripts()
     if not records:
@@ -775,15 +810,10 @@ def reopen_stats(ticket_type: str = "") -> Dict[str, Any]:
         # An exact match can only be one type, so the label is whatever it matched.
         label = matched[0].get("intent_label", ticket_type)
     else:
-        # Fixed: the partial match used to fall straight into _reopen_row with
-        # matched[0]'s label. An exact match cannot span types; a substring can.
-        # "compensation" hits compensation_hotel_request AND compensation_goodwill,
-        # and the row that came back carried both types' counts under whichever
-        # label happened to be first in the file. The model reads that as a clean
-        # answer about one type and has nothing in the result to tell it otherwise.
-        # A merged row would need a label it cannot honestly have, so name the
-        # candidates and let the next turn pick one — the same shape as the miss
-        # below, which the model already knows how to answer.
+        # Fixed: a substring can span types where an exact match cannot.
+        # "compensation" hits both compensation_hotel_request and
+        # compensation_goodwill, and the merged row carried both counts under
+        # whichever label came first. Name the candidates instead.
         candidates = sorted({r.get("intent_label", "") for r in records
                              if query in r.get("intent_label", "").lower()})
         if len(candidates) > 1:
@@ -810,54 +840,23 @@ EXTRA_TOOLS: List[Dict[str, Any]] = [   # ✏️ Build 2, step 2.1: schemas for 
     {
         "name": "current_time",
         "description": (
-            "Today's date and the current local time at the care desk. Call it when the "
-            "answer depends on when 'now' is -- whether a delayed departure is still "
-            "today, what 'tonight' or 'tomorrow' means, or how far out an alternative "
-            "sits -- and not otherwise: it costs a round trip and most contacts never "
-            "need it, because the travel date is on the booking. It takes no arguments "
-            "and returns the full timestamp, the date on its own, and a reminder to "
-            "read the travel date off the booking rather than assuming it is today."
+            "Today's date and the current local time at the Larkspur care desk. Takes "
+            "no arguments.\n"
+            "When: step 1, before lookup_booking, whenever the customer uses a word "
+            "that is relative to the present moment — today, tonight, tomorrow, this "
+            "morning, still, yet, by now. Skip it when every date in play is already "
+            "absolute, because it costs a round trip most contacts do not need.\n"
+            "Returns: the full timestamp, and the date on its own.\n"
+            "Rules: this is the only source of today's date. Nothing on the booking "
+            "says which of its dates is today.\n"
         ),
         "input_schema": {"type": "object", "properties": {}, "required": [],
                          "additionalProperties": False},
-    },
-    {
-        "name": "reopen_stats",
-        "description": (
-            "Check what went wrong last time on this kind of ticket, before you write the "
-            "reply that closes it. A routine step on every disruption contact, not a "
-            "special case: call it once you know what kind of contact this is, alongside "
-            "check_policy and before your final answer. Reads Larkspur's sample of handled "
-            "transcripts and returns, for this ticket type, how many are in the sample, how "
-            "many came back within 72 hours, the recorded reason each one came back, and "
-            "the transcript ids behind the count. Those reasons are the failures to design "
-            "this reply against. Counts off a small sample, never a rate: steer by them, "
-            "and never quote them to the customer as a percentage or a prediction."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "ticket_type": {
-                    "type": "string",
-                    "description": (
-                        "The intent label for this contact, as the sample labels it "
-                        "('refund_vs_credit'). Omit it, or pass 'all', for every type — "
-                        "also the cheapest way to see the labels. A partial word naming "
-                        "one label matches it; one that fits several ('compensation') "
-                        "comes back with the candidates rather than their counts merged, "
-                        "and an unknown one comes back with the full list."
-                    ),
-                },
-            },
-            "required": [],
-            "additionalProperties": False,
-        },
     },
 ]
 
 LOCAL_TOOLS: Dict[str, Any] = {         # ✏️ Build 2, step 2.1: the functions behind them
     # next_available_day and fare_rules moved out at 2.2: the MCP server owns
     # those names now, and a name can only have one owner.
-    "reopen_stats": reopen_stats,               # written in this file, above
     "current_time": current_time,               # written in this file, above
 }
